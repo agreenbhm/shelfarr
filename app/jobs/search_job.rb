@@ -74,16 +74,16 @@ class SearchJob < ApplicationJob
 
   def search_indexer_safely(request)
     results = search_indexer(request)
-    [results, nil]
+    [ results, nil ]
   rescue IndexerClients::Base::AuthenticationError => e
     Rails.logger.error "[SearchJob] #{IndexerClient.display_name} authentication failed: #{e.message}"
-    [[], e]
+    [ [], e ]
   rescue IndexerClients::Base::ConnectionError => e
     Rails.logger.error "[SearchJob] #{IndexerClient.display_name} connection error for request ##{request.id}: #{e.message}"
-    [[], e]
+    [ [], e ]
   rescue IndexerClients::Base::Error => e
     Rails.logger.error "[SearchJob] #{IndexerClient.display_name} error for request ##{request.id}: #{e.message}"
-    [[], e]
+    [ [], e ]
   end
 
   def handle_no_results(request, indexer_error)
@@ -111,35 +111,43 @@ class SearchJob < ApplicationJob
   def search_prowlarr(request)
     book = request.book
     query = indexer_language_hint(request)
+    categories = primary_indexer_categories(request)
 
     Rails.logger.debug "[SearchJob] Searching #{IndexerClient.display_name} book query for title='#{book.title}' author='#{book.author}' extra='#{query}' (type: #{book.book_type})"
 
     structured_results = IndexerClient.search(
       query,
       book_type: book.book_type,
+      categories: categories,
       title: book.title,
       author: book.author
     )
 
-    return structured_results if structured_results.any? && !book.ebook?
-
     fallback_query = generic_indexer_query(request)
-    if structured_results.any?
-      Rails.logger.info "[SearchJob] #{IndexerClient.display_name} ebook search found #{structured_results.count} structured results for request ##{request.id}; supplementing with generic query '#{fallback_query}'"
-    else
+    results = structured_results
+
+    if structured_results.empty?
       Rails.logger.info "[SearchJob] #{IndexerClient.display_name} book search returned no results for request ##{request.id}; retrying with generic query '#{fallback_query}'"
+      results = merge_indexer_results(results, IndexerClient.search(fallback_query, book_type: book.book_type, categories: categories))
+    elsif book.ebook?
+      Rails.logger.info "[SearchJob] #{IndexerClient.display_name} ebook search found #{structured_results.count} structured results for request ##{request.id}; supplementing with generic query '#{fallback_query}'"
+      results = merge_indexer_results(results, IndexerClient.search(fallback_query, book_type: book.book_type, categories: categories))
+    elsif !strong_indexer_match?(results, request)
+      Rails.logger.info "[SearchJob] #{IndexerClient.display_name} book search found no strong match for request ##{request.id}; supplementing with generic query '#{fallback_query}'"
+      results = merge_indexer_results(results, IndexerClient.search(fallback_query, book_type: book.book_type, categories: categories))
     end
 
-    generic_results = IndexerClient.search(fallback_query, book_type: book.book_type)
-    merge_indexer_results(structured_results, generic_results)
+    finalize_indexer_results(request, results)
   end
 
   def search_generic_indexer(request)
     book = request.book
     query = generic_indexer_query(request)
+    categories = primary_indexer_categories(request)
     Rails.logger.debug "[SearchJob] Searching #{IndexerClient.display_name} for: #{query} (type: #{book.book_type})"
 
-    IndexerClient.search(query, book_type: book.book_type)
+    results = IndexerClient.search(query, book_type: book.book_type, categories: categories)
+    finalize_indexer_results(request, results)
   end
 
   def generic_indexer_query(request)
@@ -181,7 +189,7 @@ class SearchJob < ApplicationJob
 
   def search_zlibrary(request)
     book = request.book
-    query = [book.title, book.author].compact.join(" ")
+    query = [ book.title, book.author ].compact.join(" ")
     language = zlibrary_language_filter(request)
     Rails.logger.debug "[SearchJob] Searching Z-Library for: #{query} (language: #{language || 'any'})"
 
@@ -415,6 +423,73 @@ class SearchJob < ApplicationJob
 
       seen[key] = true
       merged << result
+    end
+  end
+
+  def finalize_indexer_results(request, results)
+    results = filter_broad_results(results, request) if SettingsService.unrestricted_indexer_search_scope?
+    supplement_with_broad_search(request, results)
+  end
+
+  def supplement_with_broad_search(request, results)
+    return results unless SettingsService.broad_indexer_search_scope?
+
+    query = generic_indexer_query(request)
+    Rails.logger.info "[SearchJob] Supplementing #{IndexerClient.display_name} search for request ##{request.id} without category restrictions using '#{query}'"
+
+    broad_results = IndexerClient.search(query, categories: [])
+    merge_indexer_results(results, filter_broad_results(broad_results, request))
+  rescue IndexerClients::Base::Error => e
+    Rails.logger.warn "[SearchJob] #{IndexerClient.display_name} broad search failed for request ##{request.id}: #{e.message}"
+    results
+  end
+
+  def primary_indexer_categories(request)
+    SettingsService.indexer_category_ids_for(request.book.book_type)
+  end
+
+  def strong_indexer_match?(results, request)
+    threshold = SettingsService.get(:min_match_confidence)
+
+    Array(results).any? do |result|
+      next false if SettingsService.unrestricted_indexer_search_scope? &&
+        !compatible_result_categories?(result, request.book.book_type)
+
+      score_result = ReleaseScorer.score(search_result_for_scoring(result), request)
+      score_result.total >= threshold
+    end
+  end
+
+  def search_result_for_scoring(result)
+    SearchResult.new(
+      title: result.title,
+      seeders: result.seeders,
+      download_url: result.download_url,
+      magnet_url: result.magnet_url
+    )
+  end
+
+  def filter_broad_results(results, request)
+    threshold = SettingsService.get(:min_match_confidence)
+
+    Array(results).select do |result|
+      compatible_result_categories?(result, request.book.book_type) &&
+        ReleaseScorer.score(search_result_for_scoring(result), request).total >= threshold
+    end
+  end
+
+  def compatible_result_categories?(result, book_type)
+    category_ids = Array(result.category_ids).map(&:to_i)
+    standard_category_ids = category_ids.select { |id| id.between?(1000, 7999) }
+    return true if standard_category_ids.empty?
+
+    case book_type&.to_sym
+    when :audiobook
+      standard_category_ids.any? { |id| id.between?(3000, 3999) }
+    when :ebook
+      standard_category_ids.any? { |id| id.between?(7000, 7999) }
+    else
+      true
     end
   end
 end
