@@ -9,19 +9,26 @@ class PathTemplateService
     authorSort titleSort seriesSort seriesNum
   ].freeze
   FORMATTABLE_VARIABLES = %w[seriesNum].freeze
-  DEFAULT_TEMPLATE = "{author}/{title}".freeze
   DEFAULT_FILENAME_TEMPLATE = "{author} - {title}".freeze
   TOKEN_PATTERN = /\{([^{}]+)\}/
 
   class << self
     # Build a relative path from a template and book metadata
     def build_path(book, template)
-      render_path_template(book, sanitize_template(template))
+      render_path_template(book, template)
+    end
+
+    # True when the book's path template is blank, meaning files are written
+    # directly into the output root rather than a per-book folder
+    def flat_output?(book)
+      template_for(book).blank?
     end
 
     # Validate a template string, returns [valid, error_message]
     def validate_template(template, mode: :path)
+      return [ true, nil ] if mode == :path && template.blank?
       return [ false, "Template cannot be empty" ] if template.blank?
+
       parsed_expressions = extract_template_expressions(template)
       parsed_tokens = parsed_expressions.map { |expr| parse_expression(expr) }
       invalid_expressions = parsed_expressions.zip(parsed_tokens).filter_map do |expr, token|
@@ -77,7 +84,7 @@ class PathTemplateService
       template = template_for(book)
       relative_path = build_path(book, template)
 
-      File.join(base, relative_path)
+      relative_path.present? ? File.join(base, relative_path) : base
     end
 
     # Build a filename from a template and book metadata
@@ -126,13 +133,6 @@ class PathTemplateService
         .truncate(100, omission: "") # Limit length
     end
 
-    # Sanitize template to prevent path traversal
-    def sanitize_template(template)
-      return DEFAULT_TEMPLATE if template.blank?
-
-      template.to_s
-    end
-
     # Sanitize filename template (no path segments allowed)
     def sanitize_filename_template(template)
       return DEFAULT_FILENAME_TEMPLATE if template.blank?
@@ -157,6 +157,8 @@ class PathTemplateService
     end
 
     def render_path_template(book, template)
+      return "" if template.blank?
+
       result = render_template(book, template, variant: :path)
       sanitize_path(cleanup_path_result(result))
     end
