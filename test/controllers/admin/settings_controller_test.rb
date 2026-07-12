@@ -114,6 +114,15 @@ class Admin::SettingsControllerTest < ActionDispatch::IntegrationTest
     assert_select "p", text: "Direct"
   end
 
+  test "index shows split audiobook bundle imports setting" do
+    get admin_settings_url
+
+    assert_response :success
+    assert_select "label", text: "Split Audiobook Bundle Imports"
+    assert_select "input[name='settings[split_audiobook_bundle_imports]']"
+    assert_select "p", text: /MP3, FLAC, and other chapter-based releases stay together/
+  end
+
   test "index shows OIDC auto redirect setting" do
     get admin_settings_url
 
@@ -163,6 +172,17 @@ class Admin::SettingsControllerTest < ActionDispatch::IntegrationTest
 
     assert_redirected_to admin_settings_path
     assert_equal true, SettingsService.get(:oidc_link_existing_users)
+  end
+
+  test "bulk_update stores split audiobook bundle imports setting" do
+    patch bulk_update_admin_settings_url, params: {
+      settings: {
+        split_audiobook_bundle_imports: "true"
+      }
+    }
+
+    assert_redirected_to admin_settings_path
+    assert_equal true, SettingsService.get(:split_audiobook_bundle_imports)
   end
 
   test "index shows library picker dropdown when audiobookshelf configured" do
