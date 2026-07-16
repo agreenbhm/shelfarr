@@ -108,9 +108,13 @@ export default class extends Controller {
   }
 
   submitForm() {
-    if (this.hasFormTarget) {
-      this.formTarget.requestSubmit();
-    }
+    if (!this.hasFormTarget) return;
+
+    // Server-side validation is authoritative for bulk auto-save. Full-form
+    // HTML5 constraint validation would block unrelated settings when an
+    // indexer URL is mid-edit or on a hidden tab (where the browser bubble is
+    // easy to miss). The form uses novalidate; type="url" remains a soft hint.
+    this.formTarget.requestSubmit();
   }
 
   handleSubmitEnd(event) {
@@ -137,16 +141,23 @@ export default class extends Controller {
     const provider = this.indexerProviderTarget.value;
 
     if (this.hasProwlarrFieldsTarget) {
-      this.prowlarrFieldsTarget.classList.toggle("hidden", provider !== "prowlarr");
+      this.toggleProviderFields(this.prowlarrFieldsTarget, provider === "prowlarr");
     }
 
     if (this.hasJackettFieldsTarget) {
-      this.jackettFieldsTarget.classList.toggle("hidden", provider !== "jackett");
+      this.toggleProviderFields(this.jackettFieldsTarget, provider === "jackett");
     }
 
     if (this.hasNewznabFieldsTarget) {
-      this.newznabFieldsTarget.classList.toggle("hidden", provider !== "newznab");
+      this.toggleProviderFields(this.newznabFieldsTarget, provider === "newznab");
     }
+  }
+
+  toggleProviderFields(container, active) {
+    container.classList.toggle("hidden", !active);
+    container.querySelectorAll('input[type="url"]').forEach((input) => {
+      input.disabled = !active;
+    });
   }
 
   urlListContainer(event) {
