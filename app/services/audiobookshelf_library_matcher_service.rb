@@ -68,7 +68,7 @@ class AudiobookshelfLibraryMatcherService
       matches.pop if matches.size > limit
     end
 
-    matches
+    matches.sort_by { |match| [ -match.score, match.item.title.to_s.downcase ] }.take(limit)
   end
 
   private
