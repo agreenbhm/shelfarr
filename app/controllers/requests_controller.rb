@@ -36,7 +36,66 @@ class RequestsController < ApplicationController
     base_requests = Current.user.admin? ? Request : Request.for_user(Current.user)
     @attention_count = base_requests.needs_attention.count
     @active_count = base_requests.active.where(attention_needed: false).count
+
+    # Pagination to limit fuzzy matching overhead
+    @requests_page = params[:page].to_i.clamp(1, 1_000_000)
+    @requests_per_page = 25
+    @requests_total_count = @requests.count
+    @requests_total_pages = [ (@requests_total_count.to_f / @requests_per_page).ceil, 1 ].max
+    @requests_page = @requests_page.clamp(1, @requests_total_pages)
+    @requests = @requests.limit(@requests_per_page).offset((@requests_page - 1) * @requests_per_page)
+
+    # Preload library matches for admin (used for "In Library" pill on each card).
+    # Scope candidates to the library IDs configured for each book type so an
+    # ebook copy doesn't mark an audiobook request as "In Library".
+    # Deduplicate by book_id to avoid re-matching the same book across multiple requests.
+    @library_matches_by_book = if Current.user&.admin? && LibraryItem.available_for_matching.exists?
+      matcher = AudiobookshelfLibraryMatcherService.new
+      @requests.map(&:book).uniq.each_with_object({}) do |book, hash|
+        hash[book.id] = matcher.matches_for(
+          title: book.title,
+          author: book.author,
+          limit: 1,
+          library_ids: library_ids_for_book_type(book.book_type)
+        )
+      end
+    else
+      {}
+    end
   end
+
+  def library_ids_for_book_type(book_type)
+    all_configured_ids = [
+      SettingsService.get(:audiobookshelf_audiobook_library_id),
+      SettingsService.get(:audiobookshelf_ebook_library_id),
+      SettingsService.get(:audiobookshelf_comicbook_library_id),
+      SettingsService.get(:audiobookshelf_audiobook_scan_library_ids),
+      SettingsService.get(:audiobookshelf_ebook_scan_library_ids),
+      SettingsService.get(:audiobookshelf_comicbook_scan_library_ids)
+    ].flat_map { |id| id.to_s.split(",").map(&:strip) }.filter_map(&:presence)
+
+    if all_configured_ids.empty?
+      return nil # Preserve all-library matching when synchronization used discovery
+    end
+
+    delivery_key, scan_key = case book_type.to_s
+    when "audiobook"
+      [ :audiobookshelf_audiobook_library_id, :audiobookshelf_audiobook_scan_library_ids ]
+    when "comicbook"
+      delivery_id = SettingsService.get(:audiobookshelf_comicbook_library_id).presence ||
+                    SettingsService.get(:audiobookshelf_ebook_library_id)
+      scan_ids = SettingsService.get(:audiobookshelf_comicbook_scan_library_ids)
+      return [ delivery_id, scan_ids ].flat_map { |id| id.to_s.split(",").map(&:strip) }.filter_map(&:presence).uniq
+    else # ebook
+      [ :audiobookshelf_ebook_library_id, :audiobookshelf_ebook_scan_library_ids ]
+    end
+
+    [
+      SettingsService.get(delivery_key),
+      SettingsService.get(scan_key)
+    ].flat_map { |id| id.to_s.split(",").map(&:strip) }.filter_map(&:presence).uniq
+  end
+  private :library_ids_for_book_type
 
   def show
     @request_events = Current.user.admin? ? @request.request_events.recent.limit(10) : RequestEvent.none
